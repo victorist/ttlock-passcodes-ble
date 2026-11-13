@@ -287,12 +287,15 @@ def _get_connection(hass: HomeAssistant, entity_id: str):
             for mac_str, conn in getattr(
                 candidate_entry.runtime_data, "connections", {}
             ).items():
-                if _norm(mac_str) != entity_mac:
+                # ВАЖНО: обе стороны сравнения через _norm() — entity_mac
+                # отформатирован (78:58:44:15:28:4D), ключи dict могут быть
+                # в любом формате (78584415284D и т.п.)
+                if _norm(mac_str) != _norm(entity_mac):
                     continue
                 for candidate in getattr(
                     candidate_entry.runtime_data, "virtual_keys", []
                 ) or []:
-                    if _norm(getattr(candidate, "lockMac", "")) == entity_mac:
+                    if _norm(getattr(candidate, "lockMac", "")) == _norm(entity_mac):
                         return candidate, conn
                 return None, conn
 
@@ -306,7 +309,7 @@ def _get_connection(hass: HomeAssistant, entity_id: str):
     key = None
     if entity_mac:
         for candidate in virtual_keys:
-            if _norm(getattr(candidate, "lockMac", "")) == entity_mac:
+            if _norm(getattr(candidate, "lockMac", "")) == _norm(entity_mac):
                 key = candidate
                 break
     if key is None:
@@ -681,8 +684,9 @@ async def _async_execute_queued(
                         attempt, op.op, op.entity_id, exc,
                     )
                     await asyncio.sleep(retry_gap)
-                except (ServiceValidationError, ValueError) as exc:
-                    # Не ретраится: некорректные данные/конфигурация.
+                except (ServiceValidationError, ValueError, AttributeError) as exc:
+                    # Не ретраится: некорректные данные/конфигурация или
+                    # отсутствующий метод API интеграции/SDK (детерминировано).
                     _LOGGER.debug(
                         "non-retryable: %s %s: %s", op.op, op.entity_id, exc
                     )
@@ -727,20 +731,58 @@ async def _async_run_get_op(op: PasscodeOperation) -> list[dict]:
     connection = op.params["connection"]
     entity_id = op.entity_id
 
-    try:
-        # async_get_passcodes уже есть в TtlockBleConnection (connection.py строка 305)
-        passcode_entries = await connection.async_get_passcodes()
-    except HomeAssistantError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        # Логируем исходное исключение — иначе реальная причина
-        # (таймаут GATT, спящий замок, отсутствие Admin Key) скрыта.
-        _LOGGER.exception(
-            "get_passcodes: ошибка BLE при чтении PIN-кодов %s", entity_id
-        )
-        raise HomeAssistantError(
-            f"Ошибка BLE при чтении PIN-кодов {entity_id}: {exc}"
-        ) from exc
+    # Чтение списка PIN-кодов:
+    #  - свежие версии ha-ttlock-ble: connection.async_get_passcodes()
+    #  - старые версии: метода нет — работаем через клиент SDK напрямую
+    #    (client.get_passcodes(), паттерн _async_run_command: _lock ->
+    #    _async_ensure_connected_locked -> клиент)
+    getter = getattr(connection, "async_get_passcodes", None)
+    if callable(getter):
+        try:
+            passcode_entries = await getter()
+        except HomeAssistantError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # Логируем исходное исключение — иначе реальная причина
+            # (таймаут GATT, спящий замок, отсутствие Admin Key) скрыта.
+            _LOGGER.exception(
+                "get_passcodes: ошибка BLE при чтении PIN-кодов %s", entity_id
+            )
+            raise HomeAssistantError(
+                f"Ошибка BLE при чтении PIN-кодов {entity_id}: {exc}"
+            ) from exc
+    else:
+        connect = getattr(connection, "_async_ensure_connected_locked", None)
+        if not callable(connect):
+            raise ServiceValidationError(
+                "Установленная версия ha-ttlock-ble не поддерживает чтение "
+                "PIN-кодов (нет connection.async_get_passcodes и "
+                "_async_ensure_connected_locked). Обновите интеграцию "
+                "ttlock_ble через HACS до актуальной версии"
+            )
+        from ttlock_ble import TTLockError  # noqa: PLC0415
+
+        try:
+            async with connection._lock:  # noqa: SLF001
+                client = await connect()  # noqa: SLF001
+                if client is None:
+                    raise HomeAssistantError("Замок недоступен по BLE")
+                passcode_entries = await client.get_passcodes()
+        except AttributeError as exc:
+            # Детерминированная ошибка API — в ретраях смысла нет.
+            raise AttributeError(
+                f"SDK ttlock-ble не содержит client.get_passcodes: {exc}"
+            ) from exc
+        except HomeAssistantError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await connection._async_disconnect_locked()  # noqa: SLF001
+            _LOGGER.exception(
+                "get_passcodes: ошибка BLE при чтении PIN-кодов %s", entity_id
+            )
+            raise HomeAssistantError(
+                f"Ошибка BLE при чтении PIN-кодов {entity_id}: {exc}"
+            ) from exc
 
     if passcode_entries is None:
         raise HomeAssistantError(
@@ -968,9 +1010,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 
 def _type_name(pwd_type: int | str) -> str:
-    """Возвращает человекочитаемое название типа PIN-кода."""
+    """Возвращает человекочитаемое название типа PIN-кода.
+
+    KeyboardPwdType из SDK ttlock-ble: PERMANENT=1, COUNT=2, PERIOD=3, CIRCLE=4.
+    """
     try:
-        return {1: "permanent", 2: "erase", 3: "period", 5: "circle"}.get(
+        return {1: "permanent", 2: "count", 3: "period", 4: "circle"}.get(
             int(pwd_type), f"type_{pwd_type}"
         )
     except (TypeError, ValueError):

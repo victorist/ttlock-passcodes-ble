@@ -1,0 +1,173 @@
+alias: "TTLock BLE — Показать список PIN-кодов"
+description: "Получает список PIN-кодов замка напрямую через BLE. Замок пробуждается BLE-запросом — не требует, чтобы он уже был онлайн в HA."
+
+fields:
+  lock_entity:
+    name: "Замок"
+    required: true
+    selector:
+      entity:
+        filter:
+          - integration: ttlock_ble
+            domain: lock
+  browser_id:
+    name: "Browser ID"
+    required: false
+    selector:
+      text:
+
+sequence:
+  # 1. Переменные
+  - variables:
+      selected_name: >-
+        {{ state_attr(lock_entity, 'friendly_name') | default(lock_entity) }}
+      bid: "{{ browser_id | default('') }}"
+
+  # 2. Показываем «подключение...» пока идёт BLE-запрос
+  - if:
+      - condition: template
+        value_template: "{{ bid | length > 0 }}"
+    then:
+      - action: browser_mod.popup
+        data:
+          browser_id: "{{ bid }}"
+          title: "⏳ TTLock BLE — подключение..."
+          adaptive: true
+          content:
+            type: markdown
+            content: |
+              ### 📡 {{ selected_name }}
+
+              Подключение к замку через BLE (ESP32 Proxy)...
+
+              Замок может находиться в спящем режиме — ожидаем пробуждения.
+
+  # 3. Запрос к замку через BLE — без предварительной проверки состояния.
+  - action: ttlock_ble_passcode.get_passcodes
+    continue_on_error: true
+    data:
+      entity_id: "{{ lock_entity }}"
+    response_variable: resp
+
+  # 4. Анализ ответа и отображение результата
+  - variables:
+      got_response: >-
+        {{ resp is defined and resp is mapping and 'passcodes' in resp }}
+
+      expired_count: >-
+        {% if resp is defined and resp is mapping %}
+          {% set ns = namespace(count=0) %}
+          {% set now_ts = now().timestamp() %}
+          {% for item in resp.get('passcodes', []) %}
+            {% if item is mapping %}
+              {% set p_type = item.get('type', '') %}
+              {% set end_val = item.get('end_date', '') | string %}
+              {% set is_perm = (p_type == 'permanent' or end_val.startswith('1970') or not end_val or end_val == 'None') %}
+              {% if not is_perm and as_timestamp(end_val, 0) > 0 and as_timestamp(end_val, 0) < now_ts %}
+                {% set ns.count = ns.count + 1 %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.count }}
+        {% else %}
+          0
+        {% endif %}
+
+      table_html: >-
+        {% if resp is defined and resp is mapping %}
+          {% set codes = resp.get('passcodes', []) %}
+          {% if codes | length > 0 %}
+            {% set ns = namespace(rows='') %}
+            {% set now_ts = now().timestamp() %}
+            {% for item in codes %}
+              {% if item is mapping %}
+                {% set p_code = item.get('passcode') or item.get('new_passcode') or '—' %}
+                {% set p_type = item.get('type', '') %}
+                {% set end_val = item.get('end_date', '') | string %}
+                {% set is_perm = (p_type == 'permanent' or end_val.startswith('1970') or not end_val or end_val == 'None') %}
+                {% set p_expired = not is_perm and as_timestamp(end_val, 0) > 0 and as_timestamp(end_val, 0) < now_ts %}
+                {% if is_perm %}
+                  {% set end_str = 'Постоянный' %}
+                {% else %}
+                  {% set end_str = as_timestamp(end_val) | timestamp_custom('%d.%m.%Y %H:%M', default=end_val) %}
+                {% endif %}
+                {% set start_val = item.get('start_date', '') | string %}
+                {% if start_val and not start_val.startswith('1970') and start_val != 'None' %}
+                  {% set start_str = as_timestamp(start_val) | timestamp_custom('%d.%m.%Y', default='') %}
+                {% else %}
+                  {% set start_str = '' %}
+                {% endif %}
+                {% set status_icon = '🔴' if p_expired else '🟢' %}
+                {% set row = '<tr style="border-bottom:1px solid #333"><td style="padding:6px 4px"><code>' ~ p_code ~ '</code></td><td style="padding:6px 4px">' ~ (start_str ~ ' → ' if start_str else '') ~ end_str ~ '</td><td style="padding:6px 4px;text-align:center">' ~ status_icon ~ '</td></tr>' %}
+                {% set ns.rows = ns.rows ~ row %}
+              {% endif %}
+            {% endfor %}
+            <table style="width:100%;border-collapse:collapse;margin-top:5px">
+              <thead><tr style="border-bottom:2px solid #555;text-align:left">
+                <th style="padding:6px 4px">PIN-код</th>
+                <th style="padding:6px 4px">Срок действия</th>
+                <th style="padding:6px 4px;text-align:center">Статус</th>
+              </tr></thead>
+              <tbody>{{ ns.rows }}</tbody>
+            </table>
+          {% else %}
+            <p>⚠️ <b>PIN-коды не найдены</b> в памяти замка.<br>
+            <small style="color:#888">Примечание: через BLE видны только Custom Passcode (period/permanent/circle).</small></p>
+          {% endif %}
+          <details style="margin-top:12px;color:#888">
+            <summary style="cursor:pointer;font-size:0.85em">🔍 Отладка (raw JSON)</summary>
+            <pre style="font-size:0.75em;white-space:pre-wrap;background:#111;padding:6px;border-radius:4px;max-height:120px;overflow-y:auto">{{ resp | to_json }}</pre>
+          </details>
+        {% else %}
+          <p>❌ <b>Нет ответа от замка.</b><br>
+          Возможные причины:<br>
+          • Замок спит — TTLock нельзя «разбудить» BLE-запросом: нажмите на клавиатуре замка и повторите<br>
+          • ESP32 BLE Proxy вне зоны видимости замка<br>
+          • Нет Admin Key для этого замка<br>
+          • Таймаут BLE-соединения<br><br>
+          <small style="color:#888">Состояние в HA: <b>{{ states(lock_entity) }}</b></small><br>
+          <small style="color:#888">Подробности — в логе Home Assistant (запись «get_passcodes: ошибка BLE»).</small></p>
+        {% endif %}
+
+  # 5. Закрыть предыдущий popup
+  - if:
+      - condition: template
+        value_template: "{{ bid | length > 0 }}"
+    then:
+      - action: browser_mod.close_popup
+        data:
+          browser_id: "{{ bid }}"
+        continue_on_error: true
+
+  - delay:
+      milliseconds: 300
+
+  # 6. Показать результат — с кнопкой удаления истёкших, если они есть
+  - if:
+      - condition: template
+        value_template: "{{ bid | length > 0 and got_response and (expired_count | int) > 0 }}"
+    then:
+      - action: browser_mod.popup
+        data:
+          browser_id: "{{ bid }}"
+          title: "🔑 PIN-коды BLE: {{ selected_name }}"
+          adaptive: true
+          right_button: "🗑️ Удалить истёкшие ({{ expired_count }})"
+          right_button_variant: danger
+          right_button_action:
+            action: script.ttlock_ble_udalit_istekshie_pin_kody
+            data:
+              lock_entity: "{{ lock_entity }}"
+              browser_id: "{{ bid }}"
+          content: "{{ table_html }}"
+    else:
+      - if:
+          - condition: template
+            value_template: "{{ bid | length > 0 }}"
+        then:
+          - action: browser_mod.popup
+            data:
+              browser_id: "{{ bid }}"
+              title: "{{ '🔑 PIN-коды BLE: ' ~ selected_name if got_response else '⚠️ BLE недоступен: ' ~ selected_name }}"
+              adaptive: true
+              content: "{{ table_html }}"

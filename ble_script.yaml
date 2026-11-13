@@ -1,0 +1,619 @@
+alias: "Создать PIN-код TTLock BLE"
+description: "Создание PIN-кода через BLE. Замок автоматически 'пробуждается' запросом get_passcodes перед записью кода. Облако не используется."
+
+fields:
+  lock_entity:
+    name: "Замок"
+    required: true
+    selector:
+      entity:
+        filter:
+          - integration: ttlock_ble
+            domain: lock
+
+  passcode_name:
+    name: "Имя PIN-кода"
+    required: true
+    selector:
+      text:
+
+  # ВАЖНО: без selector! Browser Mod передаёт цифровое значение как число (int),
+  # а HA валидирует поля скрипта по selector'ам (text => str) и падает
+  # с "expected str at 'passcode'". Преобразование в строку выполняется
+  # ниже в переменной target_pin: "{{ passcode | string }}".
+  passcode:
+    name: "PIN-код"
+    required: true
+
+  start_time:
+    name: "Начало действия"
+    required: true
+    selector:
+      datetime:
+
+  end_time:
+    name: "Окончание действия"
+    required: true
+    selector:
+      datetime:
+
+  browser_id:
+    name: "Browser ID"
+    required: false
+    selector:
+      text:
+
+sequence:
+  # ==========================================================
+  # 1. ИНИЦИАЛИЗАЦИЯ И ПРИВЕДЕНИЕ ДАТ
+  # ==========================================================
+  - variables:
+      selected_name: >-
+        {{ state_attr(lock_entity, 'friendly_name') | default(lock_entity) }}
+      target_pin: "{{ passcode | string }}"
+      # Коррекция дат: миллисекунды из Browser Mod -> строка YYYY-MM-DD HH:MM:SS
+      formatted_start_time: >-
+        {% set s = start_time | default('') | string | trim %}
+        {% if '-' in s %}
+          {{ as_timestamp(s) | timestamp_custom('%Y-%m-%d %H:%M:%S', default=s) }}
+        {% elif s | int(0) > 100000000000 %}
+          {{ (s | int / 1000) | timestamp_custom('%Y-%m-%d %H:%M:%S') }}
+        {% elif s | int(0) > 0 %}
+          {{ (s | int) | timestamp_custom('%Y-%m-%d %H:%M:%S') }}
+        {% else %}
+          {{ s }}
+        {% endif %}
+
+      formatted_end_time: >-
+        {% set s = end_time | default('') | string | trim %}
+        {% if '-' in s %}
+          {{ as_timestamp(s) | timestamp_custom('%Y-%m-%d %H:%M:%S', default=s) }}
+        {% elif s | int(0) > 100000000000 %}
+          {{ (s | int / 1000) | timestamp_custom('%Y-%m-%d %H:%M:%S') }}
+        {% elif s | int(0) > 0 %}
+          {{ (s | int) | timestamp_custom('%Y-%m-%d %H:%M:%S') }}
+        {% else %}
+          {{ s }}
+        {% endif %}
+
+      # Автоопределение сущностей подъездов и калитки
+      entity_p1: >-
+        {% if states('lock.b14_podezd_1') not in ['unknown'] %}
+          lock.b14_podezd_1
+        {% elif states('lock.borisenko_14_podezd_1') not in ['unknown'] %}
+          lock.borisenko_14_podezd_1
+        {% else %}
+          lock.b14_podezd_1
+        {% endif %}
+
+      entity_p2: >-
+        {% if states('lock.b14_podezd_2') not in ['unknown'] %}
+          lock.b14_podezd_2
+        {% elif states('lock.borisenko_14_podezd_2') not in ['unknown'] %}
+          lock.borisenko_14_podezd_2
+        {% else %}
+          lock.b14_podezd_2
+        {% endif %}
+
+      entity_kalitka: >-
+        {% if states('lock.borisenko_14_kalitka') not in ['unknown'] %}
+          lock.borisenko_14_kalitka
+        {% elif states('lock.b14_kalitka') not in ['unknown'] %}
+          lock.b14_kalitka
+        {% else %}
+          lock.borisenko_14_kalitka
+        {% endif %}
+
+      # Замок пропускаем только если он явно недоступен (unavailable).
+      # Состояние 'unknown' означает что замок спит — попробуем пробудить через BLE.
+      main_skip: "{{ states(lock_entity) in ['unavailable'] }}"
+
+  # ==========================================================
+  # 2. СТАРТОВОЕ СООБЩЕНИЕ
+  # ==========================================================
+  - if:
+      - condition: template
+        value_template: "{{ browser_id | default('') | length > 0 }}"
+    then:
+      - action: browser_mod.popup
+        data:
+          browser_id: "{{ browser_id }}"
+          title: "🔐 TTLock BLE — создание PIN"
+          adaptive: true
+          content:
+            type: markdown
+            content: |
+              ### 🔐 Создание PIN-кода (BLE)
+
+              **Замок:** {{ selected_name }}
+              **PIN:** `{{ target_pin }}`
+              **Имя:** {{ passcode_name }}
+
+              📡 Пробуждение замка через BLE...
+
+  # ==========================================================
+  # 3. ОСНОВНОЙ ЗАМОК: ПРОБУЖДЕНИЕ → ЗАПИСЬ → ВЕРИФИКАЦИЯ
+  # ==========================================================
+  - if:
+      - condition: template
+        value_template: "{{ not main_skip }}"
+    then:
+      # ШАГ 3а: Пробуждение — инициируем BLE-сессию запросом get_passcodes.
+      # Если замок спал (state=unknown), эта команда открывает GATT-соединение.
+      - action: ttlock_ble_passcode.get_passcodes
+        continue_on_error: true
+        data:
+          entity_id: "{{ lock_entity }}"
+        response_variable: wake_resp_main
+
+      # ШАГ 3б: Пауза для стабилизации GATT-сессии
+      - delay:
+          seconds: 2
+
+      # ШАГ 3в: Запись PIN-кода
+      - action: ttlock_ble_passcode.add_passcode
+        continue_on_error: true
+        data:
+          entity_id: "{{ lock_entity }}"
+          passcode: "{{ target_pin }}"
+          name: "{{ passcode_name }}"
+          start_time: "{{ formatted_start_time }}"
+          end_time: "{{ formatted_end_time }}"
+
+      # ШАГ 3г: Пауза для обработки команды замком
+      - delay:
+          seconds: 3
+
+      # ШАГ 3д: Верификация — читаем коды и ищем только что созданный
+      - action: ttlock_ble_passcode.get_passcodes
+        continue_on_error: true
+        data:
+          entity_id: "{{ lock_entity }}"
+        response_variable: resp_main
+
+    else:
+      - if:
+          - condition: template
+            value_template: "{{ browser_id | default('') | length > 0 }}"
+        then:
+          - action: browser_mod.popup
+            data:
+              browser_id: "{{ browser_id }}"
+              title: "⚠️ Замок недоступен"
+              adaptive: true
+              content:
+                type: markdown
+                content: |
+                  ### ⚠️ {{ selected_name }}
+
+                  Замок имеет статус **unavailable** — нет BLE-соединения через ESP32 Proxy.
+                  PIN-код создать невозможно. Проверьте ESP32 BLE Proxy.
+
+                  ⏳ Переходим к связанным замкам...
+
+  # Расчёт статуса основного замка
+  - variables:
+      main_status: >-
+        {% if main_skip %}
+          ⚠️ Замок недоступен
+        {% else %}
+          {% set ns = namespace(ok=false) %}
+          {% if resp_main is defined and resp_main is mapping %}
+            {% set codes = resp_main.get('passcodes', []) %}
+            {% for item in codes %}
+              {% if item is mapping %}
+                {% if item.get('passcode') | string == (target_pin | string)
+                   or item.get('new_passcode') | string == (target_pin | string) %}
+                  {% set ns.ok = true %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {% if not ns.ok and (target_pin | string) in (resp_main | string) %}
+              {% set ns.ok = true %}
+            {% endif %}
+          {% endif %}
+          {{ '✅ Подтверждён' if ns.ok else '❌ Не создан' }}
+        {% endif %}
+
+  # ==========================================================
+  # 4. ВЕТКА 1: Б14 1xx → ПОДЪЕЗД 1
+  # ==========================================================
+  - if:
+      - condition: template
+        value_template: "{{ selected_name.startswith('Б14 1') }}"
+    then:
+      - if:
+          - condition: template
+            value_template: "{{ browser_id | default('') | length > 0 }}"
+        then:
+          - action: browser_mod.popup
+            data:
+              browser_id: "{{ browser_id }}"
+              title: "🔐 TTLock BLE — статус"
+              adaptive: true
+              content:
+                type: markdown
+                content: |
+                  ### {{ selected_name }}
+                  Статус основного замка: **{{ main_status }}**
+
+                  ---
+                  ⏳ Следующий замок: **Подъезд 1**
+                  Ожидание **10 секунд** (BLE)...
+
+      - delay:
+          seconds: 10
+
+      # Пробуждение + запись для Подъезда 1
+      - variables:
+          p1_skip: "{{ states(entity_p1) in ['unavailable'] }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not p1_skip }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ browser_id | default('') | length > 0 }}"
+            then:
+              - action: browser_mod.popup
+                data:
+                  browser_id: "{{ browser_id }}"
+                  title: "🚪 Подъезд 1"
+                  adaptive: true
+                  content:
+                    type: markdown
+                    content: |
+                      ### 🚪 Подъезд 1
+                      **PIN:** `{{ target_pin }}`
+                      📡 Пробуждение через BLE...
+
+          - action: ttlock_ble_passcode.get_passcodes
+            continue_on_error: true
+            data:
+              entity_id: "{{ entity_p1 }}"
+            response_variable: wake_resp_p1
+
+          - delay:
+              seconds: 2
+
+          - action: ttlock_ble_passcode.add_passcode
+            continue_on_error: true
+            data:
+              entity_id: "{{ entity_p1 }}"
+              passcode: "{{ target_pin }}"
+              name: "{{ passcode_name }}"
+              start_time: "{{ formatted_start_time }}"
+              end_time: "{{ formatted_end_time }}"
+
+          - delay:
+              seconds: 3
+
+          - action: ttlock_ble_passcode.get_passcodes
+            continue_on_error: true
+            data:
+              entity_id: "{{ entity_p1 }}"
+            response_variable: resp_p1
+
+      - variables:
+          p1_status: >-
+            {% if p1_skip %}
+              ⚠️ Замок недоступен
+            {% else %}
+              {% set ns = namespace(ok=false) %}
+              {% if resp_p1 is defined and resp_p1 is mapping %}
+                {% set codes = resp_p1.get('passcodes', []) %}
+                {% for item in codes %}
+                  {% if item is mapping %}
+                    {% if item.get('passcode') | string == (target_pin | string)
+                       or item.get('new_passcode') | string == (target_pin | string) %}
+                      {% set ns.ok = true %}
+                    {% endif %}
+                  {% endif %}
+                {% endfor %}
+                {% if not ns.ok and (target_pin | string) in (resp_p1 | string) %}
+                  {% set ns.ok = true %}
+                {% endif %}
+              {% endif %}
+              {{ '✅ Подтверждён' if ns.ok else '❌ Не создан' }}
+            {% endif %}
+
+      - action: persistent_notification.create
+        data:
+          notification_id: "ttlock_ble_pin_result"
+          title: "TTLock BLE — результат создания PIN"
+          message: |
+            PIN: {{ target_pin }}
+            Имя: {{ passcode_name }}
+
+            • {{ selected_name }}: {{ main_status }}
+            • Подъезд 1: {{ p1_status }}
+
+      - if:
+          - condition: template
+            value_template: "{{ browser_id | default('') | length > 0 }}"
+        then:
+          - action: browser_mod.popup
+            data:
+              browser_id: "{{ browser_id }}"
+              title: "🎉 Результат операции"
+              adaptive: true
+              content:
+                type: markdown
+                content: |
+                  ### 🔐 Итог создания PIN-кода (BLE)
+
+                  **PIN:** `{{ target_pin }}` | **Имя:** {{ passcode_name }}
+
+                  * **{{ selected_name }}:** {{ main_status }}
+                  * **Подъезд 1:** {{ p1_status }}
+
+  # ==========================================================
+  # 5. ВЕТКА 2: Б14 2xx → ПОДЪЕЗД 2 + КАЛИТКА
+  # ==========================================================
+  - if:
+      - condition: template
+        value_template: "{{ selected_name.startswith('Б14 2') }}"
+    then:
+      - if:
+          - condition: template
+            value_template: "{{ browser_id | default('') | length > 0 }}"
+        then:
+          - action: browser_mod.popup
+            data:
+              browser_id: "{{ browser_id }}"
+              title: "🔐 TTLock BLE — статус"
+              adaptive: true
+              content:
+                type: markdown
+                content: |
+                  ### {{ selected_name }}
+                  Статус основного замка: **{{ main_status }}**
+
+                  ---
+                  ⏳ Следующий замок: **Подъезд 2**
+                  Ожидание **10 секунд** (BLE)...
+
+      - delay:
+          seconds: 10
+
+      # --- ПОДЪЕЗД 2 ---
+      - variables:
+          p2_skip: "{{ states(entity_p2) in ['unavailable'] }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not p2_skip }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ browser_id | default('') | length > 0 }}"
+            then:
+              - action: browser_mod.popup
+                data:
+                  browser_id: "{{ browser_id }}"
+                  title: "🚪 Подъезд 2"
+                  adaptive: true
+                  content:
+                    type: markdown
+                    content: |
+                      ### 🚪 Подъезд 2
+                      **PIN:** `{{ target_pin }}`
+                      📡 Пробуждение через BLE...
+
+          - action: ttlock_ble_passcode.get_passcodes
+            continue_on_error: true
+            data:
+              entity_id: "{{ entity_p2 }}"
+            response_variable: wake_resp_p2
+
+          - delay:
+              seconds: 2
+
+          - action: ttlock_ble_passcode.add_passcode
+            continue_on_error: true
+            data:
+              entity_id: "{{ entity_p2 }}"
+              passcode: "{{ target_pin }}"
+              name: "{{ passcode_name }}"
+              start_time: "{{ formatted_start_time }}"
+              end_time: "{{ formatted_end_time }}"
+
+          - delay:
+              seconds: 3
+
+          - action: ttlock_ble_passcode.get_passcodes
+            continue_on_error: true
+            data:
+              entity_id: "{{ entity_p2 }}"
+            response_variable: resp_p2
+
+      - variables:
+          p2_status: >-
+            {% if p2_skip %}
+              ⚠️ Замок недоступен
+            {% else %}
+              {% set ns = namespace(ok=false) %}
+              {% if resp_p2 is defined and resp_p2 is mapping %}
+                {% set codes = resp_p2.get('passcodes', []) %}
+                {% for item in codes %}
+                  {% if item is mapping %}
+                    {% if item.get('passcode') | string == (target_pin | string)
+                       or item.get('new_passcode') | string == (target_pin | string) %}
+                      {% set ns.ok = true %}
+                    {% endif %}
+                  {% endif %}
+                {% endfor %}
+                {% if not ns.ok and (target_pin | string) in (resp_p2 | string) %}
+                  {% set ns.ok = true %}
+                {% endif %}
+              {% endif %}
+              {{ '✅ Подтверждён' if ns.ok else '❌ Не создан' }}
+            {% endif %}
+
+      # Сообщение перед переходом к калитке
+      - if:
+          - condition: template
+            value_template: "{{ browser_id | default('') | length > 0 }}"
+        then:
+          - action: browser_mod.popup
+            data:
+              browser_id: "{{ browser_id }}"
+              title: "🔐 TTLock BLE — статус"
+              adaptive: true
+              content:
+                type: markdown
+                content: |
+                  * **{{ selected_name }}:** {{ main_status }}
+                  * **Подъезд 2:** {{ p2_status }}
+
+                  ---
+                  ⏳ Следующий замок: **Калитка**
+                  Ожидание **10 секунд** (BLE)...
+
+      - delay:
+          seconds: 10
+
+      # --- КАЛИТКА ---
+      - variables:
+          kalitka_skip: "{{ states(entity_kalitka) in ['unavailable'] }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ not kalitka_skip }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ browser_id | default('') | length > 0 }}"
+            then:
+              - action: browser_mod.popup
+                data:
+                  browser_id: "{{ browser_id }}"
+                  title: "🚧 Калитка"
+                  adaptive: true
+                  content:
+                    type: markdown
+                    content: |
+                      ### 🚧 Калитка
+                      **PIN:** `{{ target_pin }}`
+                      📡 Пробуждение через BLE...
+
+          - action: ttlock_ble_passcode.get_passcodes
+            continue_on_error: true
+            data:
+              entity_id: "{{ entity_kalitka }}"
+            response_variable: wake_resp_kalitka
+
+          - delay:
+              seconds: 2
+
+          - action: ttlock_ble_passcode.add_passcode
+            continue_on_error: true
+            data:
+              entity_id: "{{ entity_kalitka }}"
+              passcode: "{{ target_pin }}"
+              name: "{{ passcode_name }}"
+              start_time: "{{ formatted_start_time }}"
+              end_time: "{{ formatted_end_time }}"
+
+          - delay:
+              seconds: 3
+
+          - action: ttlock_ble_passcode.get_passcodes
+            continue_on_error: true
+            data:
+              entity_id: "{{ entity_kalitka }}"
+            response_variable: resp_kalitka
+
+      - variables:
+          kalitka_status: >-
+            {% if kalitka_skip %}
+              ⚠️ Замок недоступен
+            {% else %}
+              {% set ns = namespace(ok=false) %}
+              {% if resp_kalitka is defined and resp_kalitka is mapping %}
+                {% set codes = resp_kalitka.get('passcodes', []) %}
+                {% for item in codes %}
+                  {% if item is mapping %}
+                    {% if item.get('passcode') | string == (target_pin | string)
+                       or item.get('new_passcode') | string == (target_pin | string) %}
+                      {% set ns.ok = true %}
+                    {% endif %}
+                  {% endif %}
+                {% endfor %}
+                {% if not ns.ok and (target_pin | string) in (resp_kalitka | string) %}
+                  {% set ns.ok = true %}
+                {% endif %}
+              {% endif %}
+              {{ '✅ Подтверждён' if ns.ok else '❌ Не создан' }}
+            {% endif %}
+
+      - action: persistent_notification.create
+        data:
+          notification_id: "ttlock_ble_pin_result"
+          title: "TTLock BLE — результат создания PIN"
+          message: |
+            PIN: {{ target_pin }}
+            Имя: {{ passcode_name }}
+
+            • {{ selected_name }}: {{ main_status }}
+            • Подъезд 2: {{ p2_status }}
+            • Калитка: {{ kalitka_status }}
+
+      - if:
+          - condition: template
+            value_template: "{{ browser_id | default('') | length > 0 }}"
+        then:
+          - action: browser_mod.popup
+            data:
+              browser_id: "{{ browser_id }}"
+              title: "🎉 Результат операции"
+              adaptive: true
+              content:
+                type: markdown
+                content: |
+                  ### 🔐 Итог создания PIN-кода (BLE)
+
+                  **PIN:** `{{ target_pin }}` | **Имя:** {{ passcode_name }}
+
+                  * **{{ selected_name }}:** {{ main_status }}
+                  * **Подъезд 2:** {{ p2_status }}
+                  * **Калитка:** {{ kalitka_status }}
+
+  # ==========================================================
+  # 6. ВЕТКА 3: все остальные замки
+  # ==========================================================
+  - if:
+      - condition: template
+        value_template: >-
+          {{ not selected_name.startswith('Б14 1')
+             and not selected_name.startswith('Б14 2') }}
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: "ttlock_ble_pin_result"
+          title: "TTLock BLE — результат создания PIN"
+          message: |
+            PIN: {{ target_pin }}
+            Имя: {{ passcode_name }}
+
+            • {{ selected_name }}: {{ main_status }}
+
+      - if:
+          - condition: template
+            value_template: "{{ browser_id | default('') | length > 0 }}"
+        then:
+          - action: browser_mod.popup
+            data:
+              browser_id: "{{ browser_id }}"
+              title: "🎉 Результат операции"
+              adaptive: true
+              content:
+                type: markdown
+                content: |
+                  ### 🔐 Итог создания PIN-кода (BLE)
+
+                  **Замок:** {{ selected_name }}
+                  **PIN:** `{{ target_pin }}`
+
+                  Статус: **{{ main_status }}**

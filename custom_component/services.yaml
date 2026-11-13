@@ -1,0 +1,104 @@
+add_passcode:
+  name: "Добавить PIN-код"
+  description: >
+    Добавляет пользовательский PIN-код в замок TTLock напрямую через BLE.
+    Требует Admin Key. Код записывается в память замка и работает без облака.
+  target:
+    entity:
+      integration: ttlock_ble
+      domain: lock
+  fields:
+    passcode:
+      name: "PIN-код"
+      description: "Цифровой код от 4 до 9 знаков"
+      required: true
+      example: "123456"
+      selector:
+        text:
+    name:
+      name: "Имя"
+      description: "Название кода для идентификации"
+      required: true
+      example: "Квартира 101"
+      selector:
+        text:
+    start_time:
+      name: "Начало действия"
+      description: "Дата и время начала в формате YYYY-MM-DD HH:MM:SS"
+      required: true
+      example: "2024-11-01 00:00:00"
+      selector:
+        text:
+    end_time:
+      name: "Окончание действия"
+      description: "Дата и время окончания в формате YYYY-MM-DD HH:MM:SS"
+      required: true
+      example: "2024-12-01 00:00:00"
+      selector:
+        text:
+    timeout:
+      name: "Таймаут"
+      description: "Ожидание окна BLE-рекламы замка в секундах (10-600). По умолчанию — из конфигурации компонента (90)."
+      required: false
+      example: 90
+      selector:
+        number:
+          min: 10
+          max: 600
+          step: 1
+          unit_of_measurement: "с"
+          mode: box
+
+get_passcodes:
+  name: "Получить список PIN-кодов"
+  description: >
+    Читает список PIN-кодов, записанных в память замка, через BLE.
+    Внимание: видны только Custom Passcode (period/permanent/circle).
+    Random Timed Passcode (алгоритмические) не видны.
+  target:
+    entity:
+      integration: ttlock_ble
+      domain: lock
+  fields:
+    timeout:
+      name: "Таймаут"
+      description: "Ожидание окна BLE-рекламы замка в секундах (10-600). По умолчанию — из конфигурации компонента (90)."
+      required: false
+      example: 90
+      selector:
+        number:
+          min: 10
+          max: 600
+          step: 1
+          unit_of_measurement: "с"
+          mode: box
+
+delete_passcode:
+  name: "Удалить PIN-код"
+  description: >
+    Удаляет PIN-код из замка через BLE по значению кода.
+    Требует Admin Key.
+  target:
+    entity:
+      integration: ttlock_ble
+      domain: lock
+  fields:
+    passcode:
+      name: "PIN-код"
+      description: "Код для удаления (цифры)"
+      required: true
+      example: "123456"
+      selector:
+        text:
+    timeout:
+      name: "Таймаут"
+      description: "Ожидание окна BLE-рекламы замка в секундах (10-600). По умолчанию — из конфигурации компонента (90)."
+      required: false
+      example: 90
+      selector:
+        number:
+          min: 10
+          max: 600
+          step: 1
+          unit_of_measurement: "с"
+          mode: box

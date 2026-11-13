@@ -1,0 +1,9 @@
+{
+  "domain": "ttlock_ble_passcode",
+  "name": "TTLock BLE Passcode Manager",
+  "documentation": "https://github.com/roquerodrigo/ha-ttlock-ble",
+  "dependencies": ["ttlock_ble"],
+  "requirements": [],
+  "version": "1.1.1",
+  "iot_class": "local_push"
+}

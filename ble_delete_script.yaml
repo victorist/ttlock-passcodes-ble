@@ -1,0 +1,214 @@
+alias: "TTLock BLE — Удалить истёкшие PIN-коды"
+description: "Находит и удаляет все PIN-коды с истекшим сроком действия через BLE. Не требует, чтобы замок уже был онлайн в HA."
+
+fields:
+  lock_entity:
+    name: "Замок"
+    required: true
+    selector:
+      entity:
+        filter:
+          - integration: ttlock_ble
+            domain: lock
+  browser_id:
+    name: "Browser ID"
+    required: false
+    selector:
+      text:
+
+sequence:
+  # 1. Переменные
+  - variables:
+      selected_name: >-
+        {{ state_attr(lock_entity, 'friendly_name') | default(lock_entity) }}
+      bid: "{{ browser_id | default('') }}"
+
+  # 2. Сообщение «подключение...»
+  - if:
+      - condition: template
+        value_template: "{{ bid | length > 0 }}"
+    then:
+      - action: browser_mod.popup
+        data:
+          browser_id: "{{ bid }}"
+          title: "⏳ TTLock BLE — подключение..."
+          adaptive: true
+          content:
+            type: markdown
+            content: |
+              ### 📡 {{ selected_name }}
+
+              Подключение к замку через BLE (ESP32 Proxy)...
+
+              Читаем список PIN-кодов для поиска истёкших.
+
+  # 3. Запрос текущего списка PIN-кодов через BLE
+  - action: ttlock_ble_passcode.get_passcodes
+    continue_on_error: true
+    data:
+      entity_id: "{{ lock_entity }}"
+    response_variable: resp
+
+  # 4. Проверяем ответ
+  - variables:
+      got_response: >-
+        {{ resp is defined and resp is mapping and 'passcodes' in resp }}
+
+  # 5. Нет ответа от замка
+  - if:
+      - condition: template
+        value_template: "{{ not got_response }}"
+    then:
+      - if:
+          - condition: template
+            value_template: "{{ bid | length > 0 }}"
+        then:
+          - action: browser_mod.close_popup
+            data:
+              browser_id: "{{ bid }}"
+            continue_on_error: true
+          - delay:
+              milliseconds: 300
+          - action: browser_mod.popup
+            data:
+              browser_id: "{{ bid }}"
+              title: "⚠️ BLE недоступен: {{ selected_name }}"
+              adaptive: true
+              content:
+                type: markdown
+                content: |
+                  ### ⚠️ Нет ответа от замка
+
+                  Не удалось получить список PIN-кодов через BLE.
+
+                  Возможные причины:
+                  - ESP32 BLE Proxy вне зоны видимости замка
+                  - Нет Admin Key для этого замка
+                  - Таймаут BLE-соединения
+
+                  Состояние в HA: **{{ states(lock_entity) }}**
+
+  # 6. Есть ответ — определяем истёкшие коды
+  - if:
+      - condition: template
+        value_template: "{{ got_response }}"
+    then:
+      - variables:
+          expired_codes_json: >-
+            {% set ns = namespace(codes=[]) %}
+            {% set now_ts = now().timestamp() %}
+            {% for item in resp.get('passcodes', []) %}
+              {% if item is mapping %}
+                {% set p_type = item.get('type', '') %}
+                {% set end_val = item.get('end_date', '') | string %}
+                {% set is_perm = (p_type == 'permanent' or end_val.startswith('1970') or not end_val or end_val == 'None') %}
+                {% if not is_perm and as_timestamp(end_val, 0) > 0 and as_timestamp(end_val, 0) < now_ts %}
+                  {% set p_code = item.get('passcode') or item.get('new_passcode') %}
+                  {% if p_code %}
+                    {% set ns.codes = ns.codes + [p_code | string] %}
+                  {% endif %}
+                {% endif %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.codes | to_json }}
+
+      - variables:
+          codes_list: "{{ expired_codes_json | from_json }}"
+          codes_count: "{{ codes_list | length }}"
+
+      # Нет истёкших кодов
+      - if:
+          - condition: template
+            value_template: "{{ codes_count | int == 0 }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ bid | length > 0 }}"
+            then:
+              - action: browser_mod.close_popup
+                data:
+                  browser_id: "{{ bid }}"
+                continue_on_error: true
+              - delay:
+                  milliseconds: 300
+              - action: browser_mod.popup
+                data:
+                  browser_id: "{{ bid }}"
+                  title: "✅ TTLock BLE — всё чисто"
+                  adaptive: true
+                  content:
+                    type: markdown
+                    content: |
+                      ### ✅ {{ selected_name }}
+
+                      Истёкших PIN-кодов **не найдено**.
+
+                      Всего кодов в памяти замка: **{{ resp.get('count', 0) }}**
+
+      # Есть истёкшие — удаляем поочерёдно
+      - if:
+          - condition: template
+            value_template: "{{ codes_count | int > 0 }}"
+        then:
+          - if:
+              - condition: template
+                value_template: "{{ bid | length > 0 }}"
+            then:
+              - action: browser_mod.close_popup
+                data:
+                  browser_id: "{{ bid }}"
+                continue_on_error: true
+              - delay:
+                  milliseconds: 300
+              - action: browser_mod.popup
+                data:
+                  browser_id: "{{ bid }}"
+                  title: "🗑️ TTLock BLE — удаление {{ codes_count }} кодов"
+                  adaptive: true
+                  content:
+                    type: markdown
+                    content: |
+                      ### 🗑️ {{ selected_name }}
+
+                      Найдено **{{ codes_count }}** истёкших кодов.
+
+                      Удаление через BLE... ⏳
+
+          - repeat:
+              for_each: "{{ codes_list }}"
+              sequence:
+                - action: ttlock_ble_passcode.delete_passcode
+                  continue_on_error: true
+                  data:
+                    entity_id: "{{ lock_entity }}"
+                    passcode: "{{ repeat.item }}"
+
+                - if:
+                    - condition: template
+                      value_template: "{{ bid | length > 0 }}"
+                  then:
+                    - action: browser_mod.popup
+                      data:
+                        browser_id: "{{ bid }}"
+                        title: "🗑️ TTLock BLE — удаление {{ codes_count }} кодов"
+                        adaptive: true
+                        content:
+                          type: markdown
+                          content: |
+                            ### 🗑️ {{ selected_name }}
+
+                            ✅ Удалено: **{{ repeat.index }}** из **{{ codes_count }}**
+                            ⏳ Осталось: **{{ codes_count - repeat.index }}**
+
+                - delay:
+                    milliseconds: 500
+
+          # Пауза после удаления и обновление списка
+          - delay:
+              seconds: 2
+
+          # Автоматически обновляем список после удаления
+          - action: script.ttlock_ble_pokazat_spisok_pin_kodov
+            data:
+              lock_entity: "{{ lock_entity }}"
+              browser_id: "{{ bid if bid | length > 0 else omit }}"

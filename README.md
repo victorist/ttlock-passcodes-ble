@@ -74,18 +74,18 @@ ttlock_ble_passcode:
 ## Шаг 2: Копирование YAML-скриптов на HA и их подключение
 
 > ℹ️ YAML-скрипты (`ble_script.yaml` и др.) — это **отдельные файлы** от кастомного
-> компонента. Они идут не в `custom_components/`, а в папку `/config/ttlock_ble/`.
+> компонента. Они идут не в `custom_components/`, а в папку `/config/ble_passcode_scripts/`.
 
 ### 2а. Скопируй YAML-файлы скриптов и карточек на HA:
 
 ```bash
 # Создать папку на HA и скопировать скрипты:
-cp -r ttlock_ble/ /config/ttlock_ble/
+cp -r ttlock_ble/ /config/ble_passcode_scripts/
 ```
 
 В итоге на HA должна появиться структура:
 ```
-/config/ttlock_ble/
+/config/ble_passcode_scripts/
 ├── ble_script.yaml
 ├── ble_list_script.yaml
 ├── ble_delete_script.yaml
@@ -98,13 +98,13 @@ cp -r ttlock_ble/ /config/ttlock_ble/
 
 ```yaml
 sozdat_pin_kod_ttlock_ble:
-  !include custom_components/ttlock_ble/ble_script.yaml
+  !include ble_passcode_scripts/ble_script.yaml
 
 ttlock_ble_pokazat_spisok_pin_kodov:
-  !include custom_components/ttlock_ble/ble_list_script.yaml
+  !include ble_passcode_scripts/ble_list_script.yaml
 
 ttlock_ble_udalit_istekshie_pin_kody:
-  !include custom_components/ttlock_ble/ble_delete_script.yaml
+  !include ble_passcode_scripts/ble_delete_script.yaml
 ```
 
 Перезагрузи скрипты: **Инструменты разработчика → YAML → Перезагрузить скрипты**.

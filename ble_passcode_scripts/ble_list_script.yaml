@@ -83,6 +83,7 @@ sequence:
             {% for item in codes %}
               {% if item is mapping %}
                 {% set p_code = item.get('passcode') or item.get('new_passcode') or '—' %}
+                {% set p_name = item.get('name', '') %}
                 {% set p_type = item.get('type', '') %}
                 {% set end_val = item.get('end_date', '') | string %}
                 {% set is_perm = (p_type == 'permanent' or end_val.startswith('1970') or not end_val or end_val == 'None') %}
@@ -99,13 +100,14 @@ sequence:
                   {% set start_str = '' %}
                 {% endif %}
                 {% set status_icon = '🔴' if p_expired else '🟢' %}
-                {% set row = '<tr style="border-bottom:1px solid #333"><td style="padding:6px 4px"><code>' ~ p_code ~ '</code></td><td style="padding:6px 4px">' ~ (start_str ~ ' → ' if start_str else '') ~ end_str ~ '</td><td style="padding:6px 4px;text-align:center">' ~ status_icon ~ '</td></tr>' %}
+                {% set row = '<tr style="border-bottom:1px solid #333"><td style="padding:6px 4px"><code>' ~ p_code ~ '</code></td><td style="padding:6px 4px">' ~ p_name ~ '</td><td style="padding:6px 4px">' ~ (start_str ~ ' → ' if start_str else '') ~ end_str ~ '</td><td style="padding:6px 4px;text-align:center">' ~ status_icon ~ '</td></tr>' %}
                 {% set ns.rows = ns.rows ~ row %}
               {% endif %}
             {% endfor %}
             <table style="width:100%;border-collapse:collapse;margin-top:5px">
               <thead><tr style="border-bottom:2px solid #555;text-align:left">
                 <th style="padding:6px 4px">PIN-код</th>
+                <th style="padding:6px 4px">Имя</th>
                 <th style="padding:6px 4px">Срок действия</th>
                 <th style="padding:6px 4px;text-align:center">Статус</th>
               </tr></thead>

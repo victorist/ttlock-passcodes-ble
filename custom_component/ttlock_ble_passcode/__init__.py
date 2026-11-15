@@ -198,35 +198,91 @@ def _entity_lock_mac(hass: HomeAssistant, entity_id: str) -> str:
 _PASSCODE_KEY_ITERATIONS = 10_000
 
 
+def _passcode_digest(lock_mac: str, passcode: str) -> str:
+    """Digest, под которым ttlock_ble хранит имя кода (known_credential.py)."""
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        str(passcode).encode(),
+        str(lock_mac).upper().encode(),
+        _PASSCODE_KEY_ITERATIONS,
+    ).hex()[:32]
+
+
+def _passcode_name_entity_id(
+    hass: HomeAssistant, lock_mac: str, passcode: str
+) -> str | None:
+    """entity_id text-сущности имени PIN-кода (или None, если её нет)."""
+    unique_id = f"{lock_mac}_passcode_{_passcode_digest(lock_mac, passcode)}"
+    return er.async_get(hass).async_get_entity_id(
+        "text", TTLOCK_BLE_DOMAIN, unique_id
+    )
+
+
 def _passcode_name(
     hass: HomeAssistant, lock_mac: str, passcode: str | None
 ) -> str | None:
     """Имя PIN-кода, заданное в интеграции ttlock_ble (или None).
 
     ttlock_ble хранит имена кодов в text-сущностях с
-    unique_id = f"{lockMac}_passcode_{digest}", где digest —
-    pbkdf2_sha256(passcode, salt=lockMac.upper(), 10000 итераций)[:32]
-    (см. data/known_credential.py интеграции). Дайджест детерминирован,
-    поэтому мы можем найти сущность по значению кода. Сам замок имён
-    не хранит — они существуют только на стороне HA.
+    unique_id = f"{lockMac}_passcode_{digest}" (см. data/known_credential.py
+    интеграции). Дайджест детерминирован, поэтому мы можем найти сущность
+    по значению кода. Сам замок имён не хранит — они существуют только
+    на стороне HA.
     """
     if not passcode:
         return None
-    digest = hashlib.pbkdf2_hmac(
-        "sha256",
-        str(passcode).encode(),
-        str(lock_mac).upper().encode(),
-        _PASSCODE_KEY_ITERATIONS,
-    ).hex()[:32]
-    unique_id = f"{lock_mac}_passcode_{digest}"
-    ent_reg = er.async_get(hass)
-    entity_id = ent_reg.async_get_entity_id("text", TTLOCK_BLE_DOMAIN, unique_id)
+    entity_id = _passcode_name_entity_id(hass, lock_mac, passcode)
     if entity_id is None:
         return None
     state = hass.states.get(entity_id)
     if state is None or state.state in (None, "", "unknown", "unavailable"):
         return None
     return state.state
+
+
+async def _async_save_passcode_name_when_known(
+    hass: HomeAssistant,
+    entity_id: str,
+    passcode: str,
+    name: str,
+    attempts: int = 12,
+    delay: float = 5.0,
+) -> None:
+    """Сохранить имя нового кода в text-сущности ttlock_ble.
+
+    Сущность появляется не мгновенно: интеграция узнаёт код из журнала
+    операций, который она читает сразу после команды записи, — поэтому
+    ждём её появления (до attempts*delay секунд), затем пишем имя через
+    сервис text.set_value.
+    """
+    lock_mac = _entity_lock_mac(hass, entity_id)
+    for _ in range(attempts):
+        target = _passcode_name_entity_id(hass, lock_mac, passcode)
+        if target is not None:
+            try:
+                await hass.services.async_call(
+                    "text",
+                    "set_value",
+                    {"entity_id": target, "value": name},
+                    blocking=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Не удалось сохранить имя '%s' для PIN %s: %s",
+                    name, passcode, exc,
+                )
+                return
+            _LOGGER.info(
+                "Имя '%s' сохранено для PIN %s (сущность %s)",
+                name, passcode, target,
+            )
+            return
+        await asyncio.sleep(delay)
+    _LOGGER.warning(
+        "text-сущность имени для PIN %s не появилась за %d с — "
+        "имя '%s' не сохранено",
+        passcode, int(attempts * delay), name,
+    )
 
 
 def _all_known_locks(hass: HomeAssistant) -> list[str]:
@@ -746,13 +802,13 @@ async def _async_execute_queued(
 async def _async_run_op(hass: HomeAssistant, op: PasscodeOperation):
     """Диспетчер к исполнителям операций."""
     if op.op == "add":
-        return await _async_run_add_op(op)
+        return await _async_run_add_op(hass, op)
     if op.op == "get":
         return await _async_run_get_op(hass, op)
     return await _async_run_delete_op(op)
 
 
-async def _async_run_add_op(op: PasscodeOperation) -> dict:
+async def _async_run_add_op(hass: HomeAssistant, op: PasscodeOperation) -> dict:
     """Добавить PIN-код (один замок). Формат ответа прежний."""
     connection = op.params["connection"]
     passcode = op.params["passcode"]
@@ -760,6 +816,17 @@ async def _async_run_add_op(op: PasscodeOperation) -> dict:
         connection, passcode, op.params["start_sdk"], op.params["end_sdk"]
     )
     _LOGGER.info("PIN %s добавлен в замок %s", passcode, op.entity_id)
+
+    # Имя из формы сохраняем в интеграции ttlock_ble (text-сущность имени).
+    # Сущность появляется не сразу — интеграция узнаёт код из журнала
+    # операций, который читает сразу после записи, — ждём её в фоне.
+    name = str(op.params.get("name") or "").strip()
+    if name:
+        hass.async_create_task(
+            _async_save_passcode_name_when_known(
+                hass, op.entity_id, passcode, name
+            )
+        )
     return {"success": True, "passcode": passcode, "entity_id": op.entity_id}
 
 

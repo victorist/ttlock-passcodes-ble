@@ -2,6 +2,8 @@
 
 Адаптация проекта для работы через интеграцию **ttlock-ble** (BLE Proxy на ESP32) без использования облака TTLock.
 
+> 🌐 English version: [README_EN.md](README_EN.md)
+
 ## Новая структура репозитория
 ```
 /config/

@@ -66,11 +66,11 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional("default_timeout", default=90): vol.All(
                     int, vol.Range(min=10, max=600)
                 ),
-                vol.Optional("max_attempts_per_window", default=3): vol.All(
+                vol.Optional("max_attempts_per_window", default=2): vol.All(
                     int, vol.Range(min=1, max=10)
                 ),
-                vol.Optional("wake_retry_gap", default=2): vol.All(
-                    int, vol.Range(min=1, max=15)
+                vol.Optional("wake_retry_gap", default=0.4): vol.All(
+                    vol.Coerce(float), vol.Range(min=0.1, max=15.0)
                 ),
             }
         ),
@@ -140,6 +140,7 @@ class LockQueue:
     exec_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     executor_task: asyncio.Task | None = None
     ad_timestamps: deque = field(default_factory=lambda: deque(maxlen=30))
+    last_ad_time: float = 0.0
     trigger: Literal["bt", "last_seen", "none"] = "none"
 
 
@@ -152,6 +153,7 @@ def _store(hass: HomeAssistant) -> dict:
             "queues": {},
             "unsub_bt": [],
             "unsub_state": [],
+            "ble_semaphore": asyncio.Semaphore(1),
         },
     )
 
@@ -492,7 +494,9 @@ def _remember_advertisement(
     service_info=None,
 ) -> None:
     """Колбэк рекламы: timestamp в кольцевой буфер + взвод wake event (FR-2)."""
-    queue.ad_timestamps.append(hass.loop.time())
+    now = hass.loop.time()
+    queue.last_ad_time = now
+    queue.ad_timestamps.append(now)
     _log_period_estimate(queue)
     if service_info is not None:
         _LOGGER.debug(
@@ -542,7 +546,7 @@ def _async_register_bluetooth_trigger(hass: HomeAssistant, queue: LockQueue) -> 
                 hass, _q, "bt-advertisement", service_info
             ),
             matcher,
-            bluetooth.BluetoothScanningMode.ACTIVE,
+            bluetooth.BluetoothScanningMode.PASSIVE,
         )
     except Exception as exc:  # noqa: BLE001
         _LOGGER.debug(
@@ -669,8 +673,13 @@ def _connection_entity_state(hass: HomeAssistant, lock_entity_id: str) -> str | 
     return None
 
 
-def _lock_looks_awake(hass: HomeAssistant, entity_id: str) -> bool:
-    """FR-4: замок «awake» — state не unknown/unavailable ИЛИ BT-connection connected."""
+def _lock_looks_awake(
+    hass: HomeAssistant, entity_id: str, queue: LockQueue | None = None
+) -> bool:
+    """FR-4: замок «awake» — свежая BLE-реклама (<2 с), активное state или BT connected."""
+    if queue is not None and queue.last_ad_time > 0:
+        if (hass.loop.time() - queue.last_ad_time) < 2.0:
+            return True
     state = hass.states.get(entity_id)
     if state is not None and state.state not in SLEEP_STATES:
         return True
@@ -732,8 +741,9 @@ async def _async_execute_queued(
 ) -> None:
     """FR-4: попытки операции в окнах BLE-рекламы до истечения deadline."""
     cfg = _cfg(hass)
-    max_attempts = int(cfg.get("max_attempts_per_window", 3))
-    retry_gap = float(cfg.get("wake_retry_gap", 2))
+    max_attempts = int(cfg.get("max_attempts_per_window", 2))
+    retry_gap = float(cfg.get("wake_retry_gap", 0.4))
+    ble_semaphore: asyncio.Semaphore = _store(hass)["ble_semaphore"]
     loop = hass.loop
     async with queue.exec_lock:  # FR-6: строго последовательно на один замок
         deadline = loop.time() + op.timeout
@@ -742,8 +752,8 @@ async def _async_execute_queued(
             op.op, op.entity_id, op.timeout, queue.trigger,
         )
         while loop.time() < deadline:
-            # FR-10: awake — попытки сразу; trigger=none — без ожидания события.
-            if queue.trigger != "none" and not _lock_looks_awake(hass, op.entity_id):
+            # FR-10: awake (включая рекламу <2 с назад) — попытки сразу; trigger=none — без ожидания.
+            if queue.trigger != "none" and not _lock_looks_awake(hass, op.entity_id, queue):
                 remaining = deadline - loop.time()
                 if remaining <= 0:
                     break
@@ -751,11 +761,18 @@ async def _async_execute_queued(
                     "ожидание wake event: %s %s (осталось %.0f с)",
                     op.op, op.entity_id, remaining,
                 )
+                queue.wake_event.clear()
                 try:
                     await asyncio.wait_for(queue.wake_event.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
                     break
                 queue.wake_event.clear()
+
+            # Обновляем маршрут BLEDevice в ядре HA (актуальный ESP32 Proxy)
+            bt = _import_bluetooth()
+            if bt is not None:
+                bt.async_ble_device_from_address(hass, queue.lock_mac, connectable=True)
+
             for attempt in range(1, max_attempts + 1):
                 if loop.time() >= deadline:
                     break
@@ -763,7 +780,8 @@ async def _async_execute_queued(
                     "attempt %d/%d: %s %s", attempt, max_attempts, op.op, op.entity_id
                 )
                 try:
-                    result = await _async_run_op(hass, op)
+                    async with ble_semaphore:
+                        result = await _async_run_op(hass, op)
                     _LOGGER.debug(
                         "attempt %d: success %s %s", attempt, op.op, op.entity_id
                     )
@@ -846,8 +864,18 @@ async def _async_run_get_op(hass: HomeAssistant, op: PasscodeOperation) -> list[
         try:
             passcode_entries = await getter()
         except HomeAssistantError:
+            disconnect = getattr(connection, "_async_disconnect_locked", None)
+            lock = getattr(connection, "_lock", None)
+            if callable(disconnect) and lock is not None:
+                async with lock:
+                    await disconnect()
             raise
         except Exception as exc:  # noqa: BLE001
+            disconnect = getattr(connection, "_async_disconnect_locked", None)
+            lock = getattr(connection, "_lock", None)
+            if callable(disconnect) and lock is not None:
+                async with lock:
+                    await disconnect()
             # Логируем исходное исключение — иначе реальная причина
             # (таймаут GATT, спящий замок, отсутствие Admin Key) скрыта.
             _LOGGER.exception(
@@ -1111,6 +1139,26 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             if task is not None and not task.done():
                 task.cancel()
         _LOGGER.debug("ttlock_ble_passcode: очистка при STOP выполнена")
+
+    # Предварительная регистрация BLE-триггеров для всех замков ttlock_ble при старте,
+    # чтобы фиксировать окна рекламы заранее и не пропускать первый пакет при вызове сервиса.
+    def _prewarm_lock_triggers(_event=None) -> None:
+        ent_reg = er.async_get(hass)
+        count = 0
+        for reg_entry in ent_reg.entities.values():
+            if reg_entry.platform == TTLOCK_BLE_DOMAIN and reg_entry.domain == "lock":
+                mac = _entity_lock_mac(hass, reg_entry.entity_id)
+                if mac:
+                    _get_or_create_queue(hass, reg_entry.entity_id, mac)
+                    count += 1
+        _LOGGER.debug(
+            "ttlock_ble_passcode: предзарегистрированы триггеры для %d замков", count
+        )
+
+    _prewarm_lock_triggers()
+    if not hass.is_running:
+        from homeassistant.const import EVENT_HOMEASSISTANT_STARTED  # noqa: PLC0415
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _prewarm_lock_triggers)
 
     hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_on_ha_stop)
 
